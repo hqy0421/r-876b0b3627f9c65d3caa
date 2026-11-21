@@ -1,4 +1,5 @@
 import itertools
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Type, Union
@@ -204,30 +205,167 @@ def words_to_edges_v(
     ]
 
 
+class _Fenwick:
+    """A Fenwick tree supporting point updates, prefix sums, and order-statistic
+    lookups. Used by `edges_to_intersections` to enumerate the vertical edges
+    that are active and within an x-range, without scanning unrelated edges."""
+
+    def __init__(self, size: int):
+        self.size = size
+        self.tree = [0] * (size + 1)
+        self.depth = max(1, size.bit_length())
+
+    def add(self, index: int, delta: int) -> None:
+        i = index + 1
+        while i <= self.size:
+            self.tree[i] += delta
+            i += i & -i
+
+    def prefix(self, index: int) -> int:
+        """Sum of the tree over positions `0 ... index` (inclusive)."""
+        total = 0
+        i = index + 1
+        while i > 0:
+            total += self.tree[i]
+            i -= i & -i
+        return total
+
+    def find_kth(self, k: int) -> int:
+        """Return the smallest index whose inclusive prefix sum is >= `k`.
+
+        `k` must be >= 1 and <= the total sum of the tree.
+        """
+        index = 0
+        bit = 1 << (self.size.bit_length() - 1)
+        while bit:
+            nxt = index + bit
+            if nxt <= self.size and self.tree[nxt] < k:
+                index = nxt
+                k -= self.tree[nxt]
+            bit >>= 1
+        return index
+
+
 def edges_to_intersections(
     edges: T_obj_list, x_tolerance: T_num = 1, y_tolerance: T_num = 1
 ) -> T_intersections:
     """
     Given a list of edges, return the points at which they intersect
     within `tolerance` pixels.
+
+    A vertical edge `v` and a horizontal edge `h` intersect when:
+
+    * `v["top"]` is no greater than `h["top"] + y_tolerance`,
+    * `v["bottom"]` is no less than `h["top"] - y_tolerance`,
+    * `v["x0"]` is no less than `h["x0"] - x_tolerance`, and
+    * `v["x0"]` is no greater than `h["x1"] + x_tolerance`.
+
+    Rather than testing every vertical/horizontal pair, this sweeps the
+    horizontal edges in order of `top`, maintaining the set of vertical edges
+    whose y-range covers the current position in a Fenwick tree keyed by
+    `x0`. Each horizontal edge then reports only the vertical edges that are
+    actually within its x-range. The resulting pairs are emitted in the same
+    order as the naive nested loop (vertical edges sorted by `(x0, top)`,
+    then horizontal edges sorted by `(top, x0)`), so the returned dictionary's
+    keys, per-point edge lists, duplicates, and ordering are unchanged.
+
+    Complexity is O((N + K) log N) for N total edges and K matching pairs.
     """
     intersections: T_intersections = {}
     v_edges, h_edges = [
         list(filter(lambda x: x["orientation"] == o, edges)) for o in ("v", "h")
     ]
-    for v in sorted(v_edges, key=itemgetter("x0", "top")):
-        for h in sorted(h_edges, key=itemgetter("top", "x0")):
-            if (
-                (v["top"] <= (h["top"] + y_tolerance))
-                and (v["bottom"] >= (h["top"] - y_tolerance))
-                and (v["x0"] >= (h["x0"] - x_tolerance))
-                and (v["x0"] <= (h["x1"] + x_tolerance))
-            ):
-                vertex = (v["x0"], h["top"])
-                if vertex not in intersections:
-                    intersections[vertex] = {"v": [], "h": []}
-                intersections[vertex]["v"].append(v)
-                intersections[vertex]["h"].append(h)
+
+    sorted_v = sorted(v_edges, key=itemgetter("x0", "top"))
+    sorted_h = sorted(h_edges, key=itemgetter("top", "x0"))
+
+    if not sorted_v or not sorted_h:
+        return intersections
+
+    # Map each distinct vertical x0 to a dense slot index.
+    xs = sorted(set(v["x0"] for v in sorted_v))
+    slot_of = {x: i for i, x in enumerate(xs)}
+
+    # Sweep events, ordered so that at a given y, intervals are opened before
+    # queries and closed after them (all boundary comparisons are inclusive).
+    OPEN, QUERY, CLOSE = 0, 1, 2
+    events: List[Tuple[T_num, int, int]] = []
+    for vi, v in enumerate(sorted_v):
+        # If the vertical edge's span cannot cover any horizontal position
+        # within tolerance, no intersection is possible; skip it entirely so
+        # it never leaks into the active set.
+        if v["top"] - y_tolerance > v["bottom"] + y_tolerance:
+            continue
+        events.append((v["top"] - y_tolerance, OPEN, vi))
+        events.append((v["bottom"] + y_tolerance, CLOSE, vi))
+    for hi, h in enumerate(sorted_h):
+        events.append((h["top"], QUERY, hi))
+    events.sort(key=itemgetter(0, 1))
+
+    active: List[Dict[int, T_obj]] = [{} for _ in xs]
+    tree = _Fenwick(len(xs))
+    # Record, for each vertical edge, the horizontal edges it meets. The sweep
+    # visits horizontal edges in the same order the naive loop does, so these
+    # per-vertical lists are already sorted by horizontal edge index.
+    hits: List[List[int]] = [[] for _ in sorted_v]
+
+    for _, kind, index in events:
+        if kind == OPEN:
+            v = sorted_v[index]
+            slot = slot_of[v["x0"]]
+            active[slot][index] = v
+            tree.add(slot, 1)
+        elif kind == CLOSE:
+            v = sorted_v[index]
+            slot = slot_of[v["x0"]]
+            if index in active[slot]:
+                del active[slot][index]
+                tree.add(slot, -1)
+        else:
+            h = sorted_h[index]
+            lo_slot = bisect_left(xs, h["x0"] - x_tolerance)
+            hi_slot = bisect_right(xs, h["x1"] + x_tolerance) - 1
+            if lo_slot > hi_slot:
+                continue
+
+            before = tree.prefix(lo_slot - 1) if lo_slot > 0 else 0
+            remaining = tree.prefix(hi_slot) - before
+            if remaining == 0:
+                continue
+
+            # When the queried span of slots is small relative to the matches,
+            # a direct scan is cheaper than an order-statistic lookup per match.
+            # Both branches only touch slots that hold matches (or a span that
+            # is bounded by the match count times log N), preserving the bound.
+            if hi_slot - lo_slot + 1 <= remaining * tree.depth:
+                for slot in range(lo_slot, hi_slot + 1):
+                    group = active[slot]
+                    if group:
+                        for vi in group:
+                            hits[vi].append(index)
+            else:
+                while remaining > 0:
+                    slot = tree.find_kth(before + 1)
+                    for vi in active[slot]:
+                        hits[vi].append(index)
+                    count = len(active[slot])
+                    before += count
+                    remaining -= count
+
+    # Emit pairs in the naive loop's order: by vertical edge, then horizontal
+    # edge. Adding the vertices in that order reproduces the original
+    # insertion order of the intersections dictionary and its edge lists.
+    for vi, hit_indices in enumerate(hits):
+        if not hit_indices:
+            continue
+        v = sorted_v[vi]
+        for hi in hit_indices:
+            h = sorted_h[hi]
+            vertex = (v["x0"], h["top"])
+            if vertex not in intersections:
+                intersections[vertex] = {"v": [], "h": []}
+            intersections[vertex]["v"].append(v)
+            intersections[vertex]["h"].append(h)
     return intersections
 
 

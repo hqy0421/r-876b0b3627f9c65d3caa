@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file. The format is based on [Keep a Changelog](http://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+- Optimize `table.edges_to_intersections(...)` to use a sweep-line over vertical edges (tracked in a Fenwick tree) instead of testing every vertical/horizontal edge pair. This preserves the exact intersections, associated edges, duplicates, and ordering, while running in `O((N + K) log N)` for `N` edges and `K` intersecting pairs, rather than always scanning all pairs.
+
 ## [0.11.10] — 2026-06-14
 
 ### Changed

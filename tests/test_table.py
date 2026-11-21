@@ -2,6 +2,7 @@
 import logging
 import os
 import unittest
+from operator import itemgetter
 
 import pytest
 
@@ -250,3 +251,137 @@ class Test(unittest.TestCase):
             assert t[-2][-2] == "Uncommon"
 
             assert len(page.extract_tables({"vertical_strategy": "lines_strict"})) == 0
+
+
+def _v(x, top, bottom):
+    return {
+        "orientation": "v",
+        "x0": x,
+        "x1": x,
+        "top": top,
+        "bottom": bottom,
+        "width": 0,
+        "height": bottom - top,
+    }
+
+
+def _h(y, x0, x1):
+    return {
+        "orientation": "h",
+        "x0": x0,
+        "x1": x1,
+        "top": y,
+        "bottom": y,
+        "width": x1 - x0,
+        "height": 0,
+    }
+
+
+def _naive_intersections(edges, x_tolerance=1, y_tolerance=1):
+    """Straightforward pairwise reference implementation."""
+    intersections = {}
+    v_edges = [e for e in edges if e["orientation"] == "v"]
+    h_edges = [e for e in edges if e["orientation"] == "h"]
+    for v in sorted(v_edges, key=itemgetter("x0", "top")):
+        for h in sorted(h_edges, key=itemgetter("top", "x0")):
+            if (
+                v["top"] <= (h["top"] + y_tolerance)
+                and v["bottom"] >= (h["top"] - y_tolerance)
+                and v["x0"] >= (h["x0"] - x_tolerance)
+                and v["x0"] <= (h["x1"] + x_tolerance)
+            ):
+                vertex = (v["x0"], h["top"])
+                if vertex not in intersections:
+                    intersections[vertex] = {"v": [], "h": []}
+                intersections[vertex]["v"].append(v)
+                intersections[vertex]["h"].append(h)
+    return intersections
+
+
+class TestEdgesToIntersections(unittest.TestCase):
+    def test_matches_naive_on_exactly_equal_boundaries(self):
+        # With zero tolerance, an intersection requires the vertical edge to
+        # touch the horizontal edge's endpoints exactly; inclusive boundaries
+        # must be kept.
+        edges = [
+            _h(10, 0, 10),
+            _v(0, 0, 10),  # at left endpoint
+            _v(10, 0, 10),  # at right endpoint
+            _v(5, 0, 10),
+            _v(10.0001, 0, 10),  # just outside, no match
+        ]
+        fast = table.edges_to_intersections(edges, 0, 0)
+        naive = _naive_intersections(edges, 0, 0)
+        assert list(fast.keys()) == list(naive.keys())
+        assert fast == naive
+        assert set(fast.keys()) == {(0, 10), (10, 10), (5, 10)}
+
+    def test_matches_naive_with_tolerance(self):
+        edges = [
+            _h(10, 5, 20),
+            _v(4.5, 8, 12),  # within x tolerance, y range covers
+            _v(20.5, 11.5, 30),  # within x and y tolerance
+            _v(21, 0, 9),  # outside x and y
+            _h(12, 4, 6),
+        ]
+        fast = table.edges_to_intersections(edges, 1, 1)
+        naive = _naive_intersections(edges, 1, 1)
+        assert list(fast.keys()) == list(naive.keys())
+        assert fast == naive
+
+    def test_preserves_duplicate_edges_and_order(self):
+        # Two identical vertical edges should both appear in each vertex's "v"
+        # list, and the per-vertex edge lists should match the naive ordering.
+        v = _v(5, 0, 10)
+        edges = [_h(0, 0, 10), _h(10, 0, 10), dict(v), dict(v)]
+        fast = table.edges_to_intersections(edges)
+        naive = _naive_intersections(edges)
+        assert list(fast.keys()) == list(naive.keys())
+        assert fast == naive
+        assert all(len(entry["v"]) == 2 for entry in fast.values())
+
+    def test_empty_and_single_orientation(self):
+        assert table.edges_to_intersections([]) == {}
+        assert table.edges_to_intersections([_v(1, 0, 5)]) == {}
+        assert table.edges_to_intersections([_h(1, 0, 5)]) == {}
+
+    def test_degenerate_vertical_span(self):
+        # A vertical edge whose (tolerance-expanded) span is empty cannot
+        # intersect anything, even a horizontal edge at the same coordinate.
+        edges = [_h(5, 0, 10), _v(5, 6, 4)]
+        assert table.edges_to_intersections(edges, 0, 0) == {}
+        assert table.edges_to_intersections(edges, 1, 0) == {}
+
+
+class TestIntersectionEquivalence(unittest.TestCase):
+    """Compare the optimized intersection path against a naive scan over
+    randomly generated edge sets, including coincident and boundary cases."""
+
+    def test_random_edge_sets_match_naive(self):
+        import random
+
+        rng = random.Random(1234)
+
+        def rand_coord():
+            return rng.choice([0, 1, 2, 3, 4, 5, rng.uniform(0, 5)])
+
+        for _ in range(500):
+            edges = []
+            for _ in range(rng.randint(0, 8)):
+                x = rand_coord()
+                top = rand_coord()
+                bottom = top + rng.choice([0, 1, 2, rng.uniform(0, 5)])
+                edges.append(_v(x, top, bottom))
+            for _ in range(rng.randint(0, 8)):
+                y = rand_coord()
+                x0 = rand_coord()
+                x1 = x0 + rng.choice([0, 1, 2, rng.uniform(0, 5)])
+                edges.append(_h(y, x0, x1))
+            rng.shuffle(edges)
+
+            xt = rng.choice([0, 0.5, 1, 2])
+            yt = rng.choice([0, 0.5, 1, 2])
+            fast = table.edges_to_intersections(edges, xt, yt)
+            naive = _naive_intersections(edges, xt, yt)
+            assert list(fast.keys()) == list(naive.keys())
+            assert fast == naive
